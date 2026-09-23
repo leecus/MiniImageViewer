@@ -1,0 +1,5 @@
+app.res
+*.exe
+*.obj
+*.o
+log.txt
