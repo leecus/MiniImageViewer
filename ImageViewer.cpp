@@ -18,6 +18,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cwchar>
+#include <cstring>
+#include <cstdlib>
 
 using namespace Gdiplus;
 
@@ -39,6 +41,17 @@ static int    g_srcW = 0, g_srcH = 0;
 static std::wstring g_err;                    // 加载失败提示
 static std::wstring g_notice;                 // 状态栏临时通知（如"已关联"）
 static ULONG_PTR g_token = 0;
+
+// GIF 动画：预合成的整帧缓存 + 每帧延时
+static std::vector<Bitmap*> g_frames;
+static std::vector<UINT>    g_delays;   // 毫秒
+static int  g_frame = 0;
+static bool g_animPaused = false;
+
+// 图片信息面板（按 I 切换）
+static bool g_showInfo = false;
+static std::vector<std::wstring> g_info;
+static ULONGLONG g_fileSize = 0;
 
 static double dmin(double a, double b) { return a < b ? a : b; }
 static double dmax(double a, double b) { return a > b ? a : b; }
@@ -135,9 +148,194 @@ static void BuildList(const std::wstring& file) {
         if (_wcsicmp(g_list[i].c_str(), file.c_str()) == 0) { g_idx = (int)i; break; }
 }
 
+// ---------- GIF 动画 ----------
+static void FreeAnim(HWND hwnd) {
+    KillTimer(hwnd, 3);
+    for (Bitmap* b : g_frames) delete b;
+    g_frames.clear(); g_delays.clear();
+    g_frame = 0; g_animPaused = false;
+}
+
+static void SetupAnim(HWND hwnd) {
+    if (!g_img) return;
+    UINT nd = g_img->GetFrameDimensionsCount();
+    if (nd < 1) return;
+    std::vector<GUID> dims(nd);
+    if (g_img->GetFrameDimensionsList(dims.data(), nd) != Ok) return;
+    bool hasTime = false;
+    for (UINT i = 0; i < nd; ++i)
+        if (dims[i] == FrameDimensionTime) { hasTime = true; break; }
+    if (!hasTime) return;
+    UINT count = g_img->GetFrameCount(&FrameDimensionTime);
+    if (count < 2) return;
+
+    // 每帧延时（PropertyTagFrameDelay，单位 10ms）
+    std::vector<UINT> raw(count, 10);
+    UINT sz = g_img->GetPropertyItemSize(PropertyTagFrameDelay);
+    if (sz >= sizeof(PropertyItem)) {
+        PropertyItem* pi = (PropertyItem*)malloc(sz);
+        if (pi) {
+            if (g_img->GetPropertyItem(PropertyTagFrameDelay, sz, pi) == Ok &&
+                pi->type == PropertyTagTypeLong && pi->length >= count * 4)
+                memcpy(raw.data(), pi->value, count * 4);
+            free(pi);
+        }
+    }
+
+    // 预合成整帧：GDI+ SelectActiveFrame 已按 GIF  disposal 规则合成好画面
+    for (UINT i = 0; i < count; ++i) {
+        if (g_img->SelectActiveFrame(&FrameDimensionTime, i) != Ok) break;
+        Bitmap* fb = new Bitmap(g_srcW, g_srcH, PixelFormat32bppARGB);
+        {
+            Graphics fg(fb);
+            fg.SetCompositingMode(CompositingModeSourceCopy);  // 保留透明像素
+            fg.SetInterpolationMode(InterpolationModeNearestNeighbor);
+            fg.DrawImage(g_img, 0, 0, g_srcW, g_srcH);
+        }
+        if (fb->GetLastStatus() != Ok) { delete fb; break; }
+        g_frames.push_back(fb);
+        UINT d = raw[i] * 10;
+        if (d < 20) d = 100;   // 与浏览器一致：过快帧按 100ms 处理
+        g_delays.push_back(d);
+    }
+    if (g_frames.size() < 2) {  // 缓存失败则退回静态显示
+        for (Bitmap* b : g_frames) delete b;
+        g_frames.clear(); g_delays.clear();
+        g_img->SelectActiveFrame(&FrameDimensionTime, 0);
+        return;
+    }
+    g_frame = 0;
+    SetTimer(hwnd, 3, g_delays[0], NULL);
+}
+
+// ---------- 图片信息 ----------
+static std::wstring FmtSize(ULONGLONG b) {
+    wchar_t buf[64];
+    if (b < 1024) swprintf(buf, 64, L"%llu B", b);
+    else if (b < 1024 * 1024) swprintf(buf, 64, L"%.1f KB", b / 1024.0);
+    else swprintf(buf, 64, L"%.2f MB", b / (1024.0 * 1024.0));
+    return buf;
+}
+
+static std::wstring FormatName(Bitmap* b) {
+    // MinGW 头文件缺少 ImageFormatICO
+    static const GUID kFmtICO = {0xb96b3cb5,0x0728,0x11d3,{0x9d,0x7b,0x00,0x00,0xf8,0x1e,0xf3,0x2e}};
+    GUID g;
+    if (b->GetRawFormat(&g) != Ok) return L"未知";
+    if (g == ImageFormatJPEG) return L"JPEG";
+    if (g == ImageFormatPNG)  return L"PNG";
+    if (g == ImageFormatGIF)  return L"GIF";
+    if (g == ImageFormatBMP)  return L"BMP";
+    if (g == ImageFormatTIFF) return L"TIFF";
+    if (g == kFmtICO)         return L"ICO";
+    if (g == ImageFormatWMF)  return L"WMF";
+    if (g == ImageFormatEMF)  return L"EMF";
+    return L"其他";
+}
+
+static std::wstring PixelFormatName(PixelFormat f) {
+    wchar_t buf[64];
+    UINT bits = (f >> 8) & 0xFF;
+    if (f & PixelFormatIndexed) { swprintf(buf, 64, L"%u bpp 索引色", bits); return buf; }
+    swprintf(buf, 64, L"%u bpp", bits);
+    std::wstring s = buf;
+    if (f & PixelFormatAlpha) s += L"（含透明通道）";
+    return s;
+}
+
+// 读取 EXIF 属性到调用方缓冲（512 字节内）
+static bool Prop(Bitmap* b, PROPID id, PropertyItem* out) {
+    UINT sz = b->GetPropertyItemSize(id);
+    if (!sz || sz > 512) return false;
+    return b->GetPropertyItem(id, sz, out) == Ok;
+}
+
+static std::wstring PropAscii(PropertyItem* pi) {
+    if (pi->type != PropertyTagTypeASCII || !pi->length) return L"";
+    const char* s = (const char*)pi->value;
+    std::wstring w;
+    for (UINT i = 0; i < pi->length && s[i]; ++i) w += (wchar_t)(unsigned char)s[i];
+    while (!w.empty() && (w.back() == L' ' || w.back() == L'\r' || w.back() == L'\n')) w.pop_back();
+    return w;
+}
+
+// 标准 EXIF 为 RATIONAL；部分软件写成两个 SHORT（分子/分母），一并兼容
+static bool PropRational(PropertyItem* pi, ULONG& num, ULONG& den) {
+    if (pi->type == PropertyTagTypeRational && pi->length >= 8) {
+        ULONG* r = (ULONG*)pi->value; num = r[0]; den = r[1]; return true;
+    }
+    if (pi->type == PropertyTagTypeShort && pi->length >= 4) {
+        USHORT* r = (USHORT*)pi->value; num = r[0]; den = r[1]; return true;
+    }
+    return false;
+}
+
+static void BuildInfo() {
+    g_info.clear();
+    if (!g_img) return;
+    Bitmap* b = g_img;
+    wchar_t buf[128];
+
+    g_info.push_back(L"文件：" + BaseName(g_file));
+    g_info.push_back(L"位置：" + g_file);
+    g_info.push_back(L"大小：" + FmtSize(g_fileSize));
+    swprintf(buf, 128, L"尺寸：%d × %d（%.2f MP）", g_srcW, g_srcH, g_srcW * (double)g_srcH / 1e6);
+    g_info.push_back(buf);
+    g_info.push_back(L"格式：" + FormatName(b) + L" · " + PixelFormatName(b->GetPixelFormat()));
+    REAL dx = b->GetHorizontalResolution(), dy = b->GetVerticalResolution();
+    if (dx > 0 && dy > 0) {
+        swprintf(buf, 128, L"DPI：%.0f × %.0f", dx, dy);
+        g_info.push_back(buf);
+    }
+    if (!g_frames.empty()) {
+        ULONGLONG ms = 0;
+        for (UINT d : g_delays) ms += d;
+        swprintf(buf, 128, L"动画：%zu 帧 · 每轮 %.1f 秒 · 无限循环", g_frames.size(), ms / 1000.0);
+        g_info.push_back(buf);
+    }
+
+    // EXIF（常见拍摄参数）
+    ULONG storage[128];
+    PropertyItem* pi = (PropertyItem*)storage;
+    std::wstring make, model;
+    if (Prop(b, 0x010F, pi)) make  = PropAscii(pi);   // Make
+    if (Prop(b, 0x0110, pi)) model = PropAscii(pi);   // Model
+    if (!make.empty() || !model.empty()) {
+        std::wstring cam = make;
+        if (!model.empty()) { if (!cam.empty()) cam += L" "; cam += model; }
+        g_info.push_back(L"相机：" + cam);
+    }
+    if (Prop(b, 0x9003, pi)) {                        // DateTimeOriginal
+        std::wstring dt = PropAscii(pi);
+        if (dt.size() >= 10) { dt[4] = L'-'; dt[7] = L'-'; }
+        if (!dt.empty()) g_info.push_back(L"拍摄时间：" + dt);
+    }
+    ULONG num = 0, den = 0;
+    if (Prop(b, 0x829A, pi) && PropRational(pi, num, den) && num && den) {
+        double v = num / (double)den;               // ExposureTime
+        if (v < 1.0) swprintf(buf, 128, L"快门：1/%.0f 秒", den / (double)num);
+        else swprintf(buf, 128, L"快门：%.1f 秒", v);
+        g_info.push_back(buf);
+    }
+    if (Prop(b, 0x829D, pi) && PropRational(pi, num, den) && den) {
+        swprintf(buf, 128, L"光圈：f/%.1f", num / (double)den);   // FNumber
+        g_info.push_back(buf);
+    }
+    if (Prop(b, 0x8827, pi) && pi->type == PropertyTagTypeShort && pi->length >= 2) {
+        swprintf(buf, 128, L"ISO：%u", *(USHORT*)pi->value);
+        g_info.push_back(buf);
+    }
+    if (Prop(b, 0x920A, pi) && PropRational(pi, num, den) && den) {
+        swprintf(buf, 128, L"焦距：%.1f mm", num / (double)den);  // FocalLength
+        g_info.push_back(buf);
+    }
+}
+
 static bool LoadFile(HWND hwnd, const std::wstring& pathRaw) {
     std::wstring path = pathRaw;
     std::replace(path.begin(), path.end(), L'/', L'\\');  // 统一分隔符
+    wchar_t full[MAX_PATH * 2];
+    if (GetFullPathNameW(path.c_str(), MAX_PATH * 2, full, NULL)) path = full;
     g_err.clear();
     HANDLE hf = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
                             NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -161,9 +359,11 @@ static bool LoadFile(HWND hwnd, const std::wstring& pathRaw) {
         g_err = L"无法解码此图片";
         return false;
     }
+    FreeAnim(hwnd);
     if (g_img) delete g_img;
     if (g_stream) g_stream->Release();
     g_img = nb; g_stream = st;
+    g_fileSize = lo;
     g_srcW = (int)g_img->GetWidth();
     g_srcH = (int)g_img->GetHeight();
     g_file = path;
@@ -171,6 +371,8 @@ static bool LoadFile(HWND hwnd, const std::wstring& pathRaw) {
     std::wstring title = BaseName(path) + L" - 看图";
     SetWindowTextW(hwnd, title.c_str());
     FitToWindow(hwnd);
+    SetupAnim(hwnd);
+    BuildInfo();
     return true;
 }
 
@@ -300,7 +502,8 @@ static void DrawImageArea(Graphics* g, int cw, int ch) {
     g->SetPixelOffsetMode(PixelOffsetModeHalf);
     g->SetInterpolationMode(g_scale < 1.0 ? InterpolationModeHighQualityBicubic
                                           : InterpolationModeNearestNeighbor);
-    g->DrawImage(g_img,
+    Bitmap* src = g_frames.empty() ? g_img : g_frames[g_frame];
+    g->DrawImage(src,
                  RectF(dx0, dy0, dx1 - dx0, dy1 - dy0),
                  sx0, sy0, sx1 - sx0, sy1 - sy0,
                  UnitPixel, &attrs);
@@ -317,10 +520,14 @@ static void DrawStatusBar(Graphics* g, int cw, int ch) {
         text = BaseName(g_file)
              + L"    " + std::to_wstring(g_srcW) + L" × " + std::to_wstring(g_srcH)
              + L"    " + std::to_wstring(percent / 10) + L"." + std::to_wstring(percent % 10) + L"%";
+        if (!g_frames.empty()) {
+            text += L"    GIF " + std::to_wstring(g_frame + 1) + L"/" + std::to_wstring(g_frames.size());
+            if (g_animPaused) text += L"（已暂停，空格继续）";
+        }
     } else if (!g_err.empty()) {
         text = g_err + L"（按 Ctrl+O 重新选择）";
     } else {
-        text = L"把图片拖进窗口，或按 Ctrl+O 打开";
+        text = L"把图片拖进窗口，或按 Ctrl+O 打开（I 查看图片信息）";
     }
     static Font* font = nullptr;
     if (!font) font = new Font(L"Microsoft YaHei UI", 13, FontStyleRegular, UnitPixel);
@@ -332,6 +539,34 @@ static void DrawStatusBar(Graphics* g, int cw, int ch) {
     g->FillRectangle(&bb, RectF(0, ch - bh, box.Width + 26, bh));
     g->DrawString(text.c_str(), (INT)-1, font,
                   PointF(12, ch - bh + (bh - box.Height) / 2), &tbrush);
+}
+
+static void DrawInfoPanel(Graphics* g, int cw, int ch) {
+    if (!g_showInfo || g_info.empty()) return;
+    static Font* font = nullptr;
+    if (!font) font = new Font(L"Microsoft YaHei UI", 13, FontStyleRegular, UnitPixel);
+    const REAL pad = 12;
+    const REAL maxw = dmax(120.0, cw - 24.0 - pad * 2);
+    std::vector<RectF> boxes(g_info.size());
+    REAL totalH = 0, wmax = 0;
+    for (size_t i = 0; i < g_info.size(); ++i) {
+        g->MeasureString(g_info[i].c_str(), (INT)-1, font,
+                         RectF(0, 0, maxw, 10000), &boxes[i]);
+        totalH += boxes[i].Height + 4;
+        wmax = dmax(wmax, (double)boxes[i].Width);
+    }
+    REAL pw = dmin(wmax, maxw) + pad * 2, ph = totalH - 4 + pad * 2;
+    SolidBrush bg(Color(225, 16, 16, 22));
+    g->FillRectangle(&bg, RectF(12, 12, pw, ph));
+    Pen border(Color(70, 255, 255, 255), 1);
+    g->DrawRectangle(&border, RectF(12, 12, pw, ph));
+    SolidBrush tb(Color(255, 215, 215, 222));
+    REAL y = 12 + pad;
+    for (size_t i = 0; i < g_info.size(); ++i) {
+        g->DrawString(g_info[i].c_str(), (INT)-1, font,
+                      RectF(12 + pad, y, maxw, boxes[i].Height + 4), NULL, &tb);
+        y += boxes[i].Height + 4;
+    }
 }
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -364,6 +599,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g.FillRectangle(&bg, 0, 0, cw, ch);
             DrawImageArea(&g, cw, ch);
             DrawStatusBar(&g, cw, ch);
+            DrawInfoPanel(&g, cw, ch);
         }
         BitBlt(hdc, 0, 0, cw, ch, mem, 0, 0, SRCCOPY);
         SelectObject(mem, old);
@@ -378,6 +614,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_notice.clear();
             KillTimer(hwnd, 2);
             InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
+        if (wp == 3) {  // GIF 下一帧
+            if (!g_frames.empty() && !g_animPaused) {
+                g_frame = (g_frame + 1) % (int)g_frames.size();
+                InvalidateRect(hwnd, NULL, FALSE);
+                SetTimer(hwnd, 3, g_delays[g_frame], NULL);
+            } else {
+                KillTimer(hwnd, 3);
+            }
             return 0;
         }
         if (g_img && g_scale != g_target) {
@@ -445,8 +691,19 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case VK_LEFT:  Navigate(hwnd, -1); return 0;
         case VK_RIGHT: Navigate(hwnd,  1); return 0;
         case 'F':      FitToWindow(hwnd);  return 0;
+        case 'I':      // 图片信息面板
+            if (g_img) { g_showInfo = !g_showInfo; InvalidateRect(hwnd, NULL, FALSE); }
+            return 0;
         case '0':      ZoomTo(hwnd, 1.0);  return 0;
         case VK_ESCAPE: DestroyWindow(hwnd); return 0;
+        case VK_SPACE:  // GIF 暂停 / 继续
+            if (!g_frames.empty()) {
+                g_animPaused = !g_animPaused;
+                if (g_animPaused) KillTimer(hwnd, 3);
+                else SetTimer(hwnd, 3, g_delays[g_frame], NULL);
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
+            return 0;
         case 'O':      if (GetKeyState(VK_CONTROL) & 0x8000) PromptOpen(hwnd); return 0;
         case 'A':      // 一键关联 / 取消关联
             if (IsRegistered()) {
@@ -523,6 +780,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmd, int show) {
     MSG m;
     while (GetMessageW(&m, NULL, 0, 0)) { TranslateMessage(&m); DispatchMessageW(&m); }
 
+    for (Bitmap* b : g_frames) delete b;
     if (g_img) delete g_img;
     if (g_stream) g_stream->Release();
     GdiplusShutdown(g_token);
