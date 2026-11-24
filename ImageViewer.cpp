@@ -53,6 +53,10 @@ static bool g_showInfo = false;
 static std::vector<std::wstring> g_info;
 static ULONGLONG g_fileSize = 0;
 
+static bool g_fullscreen = false;
+static bool g_topmost = false;
+static WINDOWPLACEMENT g_prevPlace = { sizeof(WINDOWPLACEMENT) };
+
 static double dmin(double a, double b) { return a < b ? a : b; }
 static double dmax(double a, double b) { return a > b ? a : b; }
 static double ClampScale(double s) { return dmax(ZOOM_MIN, dmin(ZOOM_MAX, s)); }
@@ -60,6 +64,12 @@ static double ClampScale(double s) { return dmax(ZOOM_MIN, dmin(ZOOM_MAX, s)); }
 static void ClientSize(HWND hwnd, int& cw, int& ch) {
     RECT rc; GetClientRect(hwnd, &rc);
     cw = rc.right - rc.left; ch = rc.bottom - rc.top;
+}
+
+static RECT ClientRC(HWND hwnd) {   // 客户区矩形（屏幕坐标）
+    RECT rc; GetClientRect(hwnd, &rc);
+    MapWindowPoints(hwnd, NULL, (POINT*)&rc, 2);
+    return rc;
 }
 
 static void ClampOffsets(HWND hwnd) {
@@ -487,6 +497,264 @@ static void ShowNotice(HWND hwnd, const std::wstring& text) {
     InvalidateRect(hwnd, NULL, FALSE);
 }
 
+// ---------- 剪贴板 ----------
+static bool CopyImageToClipboard(HWND hwnd) {
+    Bitmap* src = g_frames.empty() ? g_img : g_frames[g_frame];
+    if (!src) return false;
+    int w = (int)src->GetWidth(), h = (int)src->GetHeight();
+    // 流加载位图的 Clone 瞬态状态不可靠（GetLastStatus 读后即重置），以 LockBits 结果为准
+    Bitmap* tmp = src->Clone(0, 0, w, h, PixelFormat32bppARGB);
+    if (!tmp) return false;
+    Rect r(0, 0, w, h);
+    BitmapData bd;
+    if (tmp->LockBits(&r, ImageLockModeRead, PixelFormat32bppARGB, &bd) != Ok) { delete tmp; return false; }
+    SIZE_T bytes = (SIZE_T)w * h * 4;
+    HGLOBAL hg = GlobalAlloc(GMEM_MOVEABLE, sizeof(BITMAPINFOHEADER) + bytes);
+    if (!hg) { tmp->UnlockBits(&bd); delete tmp; return false; }
+    BITMAPINFOHEADER* bi = (BITMAPINFOHEADER*)GlobalLock(hg);
+    memset(bi, 0, sizeof(*bi));
+    bi->biSize = sizeof(BITMAPINFOHEADER);
+    bi->biWidth = w; bi->biHeight = h;   // 正高度 = 自底向上
+    bi->biPlanes = 1; bi->biBitCount = 32; bi->biCompression = BI_RGB;
+    bi->biSizeImage = (DWORD)bytes;
+    BYTE* dst = (BYTE*)(bi + 1);
+    const BYTE* rows = (const BYTE*)bd.Scan0;
+    for (int y = 0; y < h; ++y)
+        memcpy(dst + (SIZE_T)(h - 1 - y) * w * 4, rows + (SIZE_T)y * bd.Stride, (SIZE_T)w * 4);
+    GlobalUnlock(hg);
+    tmp->UnlockBits(&bd);
+    delete tmp;
+    bool ok = false;
+    if (OpenClipboard(hwnd)) {
+        EmptyClipboard();
+        ok = SetClipboardData(CF_DIB, hg) != NULL;
+        HBITMAP hb = nullptr;
+        if (src->GetHBITMAP(Color(255, 255, 255), &hb) == Ok && hb)
+            SetClipboardData(CF_BITMAP, hb);   // 白底 DDB，兼容只认 CF_BITMAP 的程序
+        CloseClipboard();
+    }
+    if (!ok) GlobalFree(hg);
+    return ok;
+}
+
+static bool CopyPathToClipboard(HWND hwnd) {
+    if (g_file.empty()) return false;
+    SIZE_T bytes = (g_file.size() + 1) * sizeof(wchar_t);
+    HGLOBAL hg = GlobalAlloc(GMEM_MOVEABLE, bytes);
+    if (!hg) return false;
+    memcpy(GlobalLock(hg), g_file.c_str(), bytes);
+    GlobalUnlock(hg);
+    bool ok = false;
+    if (OpenClipboard(hwnd)) {
+        EmptyClipboard();
+        ok = SetClipboardData(CF_UNICODETEXT, hg) != NULL;
+        CloseClipboard();
+    }
+    if (!ok) GlobalFree(hg);
+    return ok;
+}
+
+// ---------- 旋转 / 翻转 ----------
+static void RotateCurrent(HWND hwnd, RotateFlipType rf, const wchar_t* msg) {
+    if (!g_img) return;
+    g_img->RotateFlip(rf);
+    for (Bitmap* b : g_frames) b->RotateFlip(rf);   // GIF 缓存帧同步旋转
+    g_srcW = (int)g_img->GetWidth();
+    g_srcH = (int)g_img->GetHeight();
+    BuildInfo();
+    FitToWindow(hwnd);
+    ShowNotice(hwnd, msg);
+}
+
+// ---------- 全屏 / 置顶 ----------
+static void ToggleFullscreen(HWND hwnd) {
+    if (!g_fullscreen) {
+        GetWindowPlacement(hwnd, &g_prevPlace);
+        LONG style = GetWindowLongW(hwnd, GWL_STYLE);
+        SetWindowLongW(hwnd, GWL_STYLE, (style & ~WS_OVERLAPPEDWINDOW) | WS_POPUP);
+        HMONITOR hm = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO mi = { sizeof(mi) };
+        GetMonitorInfoW(hm, &mi);
+        SetWindowPos(hwnd, NULL, mi.rcMonitor.left, mi.rcMonitor.top,
+                     mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top,
+                     SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+        g_fullscreen = true;
+    } else {
+        LONG style = GetWindowLongW(hwnd, GWL_STYLE);
+        SetWindowLongW(hwnd, GWL_STYLE, (style & ~WS_POPUP) | WS_OVERLAPPEDWINDOW);
+        SetWindowPlacement(hwnd, &g_prevPlace);
+        SetWindowPos(hwnd, NULL, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+        g_fullscreen = false;
+    }
+}
+
+static void ToggleTopmost(HWND hwnd) {
+    g_topmost = !g_topmost;
+    SetWindowPos(hwnd, g_topmost ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+    ShowNotice(hwnd, g_topmost ? L"窗口已置顶" : L"已取消置顶");
+}
+
+// ---------- 删除到回收站 ----------
+static void ClearImage(HWND hwnd) {
+    FreeAnim(hwnd);
+    if (g_img) { delete g_img; g_img = nullptr; }
+    if (g_stream) { g_stream->Release(); g_stream = nullptr; }
+    g_file.clear(); g_info.clear(); g_fileSize = 0;
+    g_srcW = g_srcH = 0;
+    g_list.clear(); g_idx = -1;
+    SetWindowTextW(hwnd, L"看图");
+    InvalidateRect(hwnd, NULL, FALSE);
+}
+
+static void DeleteCurrent(HWND hwnd) {
+    if (!g_img || g_file.empty()) return;
+    std::wstring msg = L"将「" + BaseName(g_file) + L"」移到回收站？";
+    if (MessageBoxW(hwnd, msg.c_str(), L"删除确认", MB_YESNO | MB_ICONWARNING) != IDYES) return;
+    std::wstring from = g_file;
+    from.push_back(L'\0');   // SHFileOperation 要求双 null 结尾
+    SHFILEOPSTRUCTW op = {0};
+    op.hwnd = hwnd; op.wFunc = FO_DELETE; op.pFrom = from.c_str();
+    op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT;
+    if (SHFileOperationW(&op) != 0 || op.fAnyOperationsAborted) { ShowNotice(hwnd, L"删除失败"); return; }
+    if (g_idx >= 0 && g_idx < (int)g_list.size()) g_list.erase(g_list.begin() + g_idx);
+    if (g_list.empty()) ClearImage(hwnd);
+    else {
+        if (g_idx >= (int)g_list.size()) g_idx = 0;
+        LoadFile(hwnd, g_list[g_idx]);
+    }
+    ShowNotice(hwnd, L"已移到回收站");
+}
+
+// ---------- 右键菜单 ----------
+enum {
+    IDM_FIT = 1001, IDM_ACTUAL, IDM_PREV, IDM_NEXT,
+    IDM_ROTATE, IDM_MIRROR,
+    IDM_INFO, IDM_COPY, IDM_COPYPATH, IDM_FOLDER,
+    IDM_WALL_FILL, IDM_WALL_FIT, IDM_WALL_STRETCH, IDM_WALL_CENTER, IDM_WALL_TILE,
+    IDM_FULL, IDM_TOP, IDM_DELETE,
+    IDM_OPEN, IDM_ASSOC, IDM_EXIT
+};
+
+static void ToggleAssoc(HWND hwnd) {
+    if (IsRegistered()) {
+        UnregisterAssoc();
+        ShowNotice(hwnd, L"已取消文件关联");
+    } else {
+        RegisterAssoc();
+        ShowNotice(hwnd, L"已注册到系统：右键图片 → 打开方式 → 看图（可设为始终使用）");
+    }
+}
+
+// 设置壁纸：导出无损 BMP 到 %APPDATA% 后经 SystemParametersInfo 应用。
+// WallpaperStyle：10=填充 6=适应 2=拉伸 0=居中；平铺另置 TileWallpaper=1
+static void SetWallpaper(HWND hwnd, const wchar_t* style, bool tile, const wchar_t* label) {
+    if (!g_img) return;
+    if (!g_frames.empty()) g_img->SelectActiveFrame(&FrameDimensionTime, 0);   // GIF 取第 0 帧
+    wchar_t appdata[MAX_PATH] = L"";
+    if (!GetEnvironmentVariableW(L"APPDATA", appdata, MAX_PATH) || !appdata[0]) {
+        ShowNotice(hwnd, L"设置壁纸失败");
+        return;
+    }
+    std::wstring dir = std::wstring(appdata) + L"\\MiniImageViewer";
+    CreateDirectoryW(dir.c_str(), NULL);
+    std::wstring path = dir + L"\\wallpaper.bmp";
+    // MinGW 头文件无内置 BMP 编码器 CLSID
+    static const GUID kEncBMP = {0x557cf400,0x1a04,0x11d3,{0x9a,0x73,0x00,0x00,0xf8,0x1e,0xf3,0x2e}};
+    if (g_img->Save(path.c_str(), &kEncBMP, NULL) != Ok) {
+        ShowNotice(hwnd, L"设置壁纸失败：无法导出图片");
+        return;
+    }
+    RegSetStr(L"Control Panel\\Desktop", L"WallpaperStyle", style);
+    RegSetStr(L"Control Panel\\Desktop", L"TileWallpaper", tile ? L"1" : L"0");
+    wchar_t buf[MAX_PATH];
+    wcscpy(buf, path.c_str());
+    if (SystemParametersInfoW(SPI_SETDESKWALLPAPER, 0, buf, SPIF_UPDATEINIFILE | SPIF_SENDCHANGE))
+        ShowNotice(hwnd, std::wstring(L"已设为桌面壁纸（") + label + L"）");
+    else
+        ShowNotice(hwnd, L"设置壁纸失败");
+}
+
+static int ShowContextMenu(HWND hwnd, POINT pt) {
+    HMENU m = CreatePopupMenu();
+    if (!m) return 0;
+    bool has = g_img != nullptr;
+    UINT en = has ? 0 : MF_GRAYED, nav = g_list.empty() ? MF_GRAYED : 0;
+    AppendMenuW(m, MF_STRING | en, IDM_FIT,    L"适应窗口\tF");
+    AppendMenuW(m, MF_STRING | en, IDM_ACTUAL, L"实际大小\t0");
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(m, MF_STRING | nav, IDM_PREV, L"上一张\t←");
+    AppendMenuW(m, MF_STRING | nav, IDM_NEXT, L"下一张\t→");
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(m, MF_STRING | en, IDM_ROTATE, L"顺时针旋转 90°\tR");
+    AppendMenuW(m, MF_STRING | en, IDM_MIRROR, L"水平镜像\tM");
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+
+    HMENU wall = CreatePopupMenu();
+    AppendMenuW(wall, MF_STRING, IDM_WALL_FILL,    L"填充（推荐）");
+    AppendMenuW(wall, MF_STRING, IDM_WALL_FIT,     L"适应");
+    AppendMenuW(wall, MF_STRING, IDM_WALL_STRETCH, L"拉伸");
+    AppendMenuW(wall, MF_STRING, IDM_WALL_CENTER,  L"居中");
+    AppendMenuW(wall, MF_STRING, IDM_WALL_TILE,    L"平铺");
+    AppendMenuW(m, MF_POPUP | en, (UINT_PTR)wall, L"设为壁纸");
+
+    AppendMenuW(m, MF_STRING | en, IDM_INFO,
+                g_showInfo ? L"隐藏图片信息\tI" : L"显示图片信息\tI");
+    AppendMenuW(m, MF_STRING | en, IDM_COPY,   L"复制图片\tCtrl+C");
+    AppendMenuW(m, MF_STRING | en, IDM_COPYPATH, L"复制文件路径\tCtrl+Shift+C");
+    AppendMenuW(m, MF_STRING | en, IDM_FOLDER, L"打开所在文件夹");
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(m, MF_STRING, IDM_FULL, g_fullscreen ? L"退出全屏\tF11" : L"全屏\tF11");
+    AppendMenuW(m, MF_STRING, IDM_TOP,  g_topmost ? L"取消置顶\tT" : L"窗口置顶\tT");
+    AppendMenuW(m, MF_STRING | en, IDM_DELETE, L"移到回收站\tDel");
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(m, MF_STRING, IDM_OPEN,  L"打开图片…\tCtrl+O");
+    AppendMenuW(m, MF_STRING, IDM_ASSOC, IsRegistered() ? L"取消文件关联\tA" : L"注册文件关联\tA");
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(m, MF_STRING, IDM_EXIT, L"退出\tEsc");
+
+    int id = TrackPopupMenu(m, TPM_RIGHTBUTTON | TPM_RETURNCMD, pt.x, pt.y, 0, hwnd, NULL);
+    DestroyMenu(m);
+    return id;
+}
+
+static void HandleMenu(HWND hwnd, int id) {
+    switch (id) {
+    case IDM_FIT:    FitToWindow(hwnd); break;
+    case IDM_ACTUAL: ZoomTo(hwnd, 1.0); break;
+    case IDM_PREV:   Navigate(hwnd, -1); break;
+    case IDM_NEXT:   Navigate(hwnd, 1);  break;
+    case IDM_INFO:
+        if (g_img) { g_showInfo = !g_showInfo; InvalidateRect(hwnd, NULL, FALSE); }
+        break;
+    case IDM_COPY:
+        ShowNotice(hwnd, CopyImageToClipboard(hwnd) ? L"已复制图像到剪贴板" : L"复制失败");
+        break;
+    case IDM_COPYPATH:
+        ShowNotice(hwnd, CopyPathToClipboard(hwnd) ? L"已复制文件路径" : L"复制失败");
+        break;
+    case IDM_ROTATE: RotateCurrent(hwnd, Rotate90FlipNone, L"顺时针旋转 90°"); break;
+    case IDM_MIRROR: RotateCurrent(hwnd, RotateNoneFlipX, L"水平镜像"); break;
+    case IDM_FULL:   ToggleFullscreen(hwnd); break;
+    case IDM_TOP:    ToggleTopmost(hwnd); break;
+    case IDM_DELETE: DeleteCurrent(hwnd); break;
+    case IDM_WALL_FILL:    SetWallpaper(hwnd, L"10", false, L"填充"); break;
+    case IDM_WALL_FIT:     SetWallpaper(hwnd, L"6",  false, L"适应"); break;
+    case IDM_WALL_STRETCH: SetWallpaper(hwnd, L"2",  false, L"拉伸"); break;
+    case IDM_WALL_CENTER:  SetWallpaper(hwnd, L"0",  false, L"居中"); break;
+    case IDM_WALL_TILE:    SetWallpaper(hwnd, L"1",  true,  L"平铺"); break;
+    case IDM_FOLDER:   // 资源管理器中定位并选中当前文件
+        if (!g_file.empty()) {
+            std::wstring params = L"/select,\"" + g_file + L"\"";
+            ShellExecuteW(hwnd, L"open", L"explorer.exe", params.c_str(), NULL, SW_SHOWNORMAL);
+        }
+        break;
+    case IDM_OPEN:  PromptOpen(hwnd); break;
+    case IDM_ASSOC: ToggleAssoc(hwnd); break;
+    case IDM_EXIT:  DestroyWindow(hwnd); break;
+    }
+}
+
 static void DrawImageArea(Graphics* g, int cw, int ch) {
     if (!g_img) return;
     double dw = g_srcW * g_scale, dh = g_srcH * g_scale;
@@ -527,7 +795,7 @@ static void DrawStatusBar(Graphics* g, int cw, int ch) {
     } else if (!g_err.empty()) {
         text = g_err + L"（按 Ctrl+O 重新选择）";
     } else {
-        text = L"把图片拖进窗口，或按 Ctrl+O 打开（I 查看图片信息）";
+        text = L"把图片拖进窗口，或按 Ctrl+O 打开（右键查看更多操作）";
     }
     static Font* font = nullptr;
     if (!font) font = new Font(L"Microsoft YaHei UI", 13, FontStyleRegular, UnitPixel);
@@ -695,7 +963,27 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_img) { g_showInfo = !g_showInfo; InvalidateRect(hwnd, NULL, FALSE); }
             return 0;
         case '0':      ZoomTo(hwnd, 1.0);  return 0;
-        case VK_ESCAPE: DestroyWindow(hwnd); return 0;
+        case 'R':      // 旋转（Shift 反向）
+            if (GetKeyState(VK_SHIFT) & 0x8000) RotateCurrent(hwnd, Rotate270FlipNone, L"逆时针旋转 90°");
+            else RotateCurrent(hwnd, Rotate90FlipNone, L"顺时针旋转 90°");
+            return 0;
+        case 'M':      RotateCurrent(hwnd, RotateNoneFlipX, L"水平镜像"); return 0;
+        case 'C':
+            if (GetKeyState(VK_CONTROL) & 0x8000) {
+                if (GetKeyState(VK_SHIFT) & 0x8000)
+                    ShowNotice(hwnd, CopyPathToClipboard(hwnd) ? L"已复制文件路径" : L"复制失败");
+                else
+                    ShowNotice(hwnd, CopyImageToClipboard(hwnd) ? L"已复制图像到剪贴板" : L"复制失败");
+            }
+            return 0;
+        case 'T':      ToggleTopmost(hwnd);  return 0;
+        case 'W':      SetWallpaper(hwnd, L"10", false, L"填充"); return 0;
+        case VK_F11:   ToggleFullscreen(hwnd); return 0;
+        case VK_DELETE: DeleteCurrent(hwnd); return 0;
+        case VK_ESCAPE:
+            if (g_fullscreen) { ToggleFullscreen(hwnd); return 0; }
+            DestroyWindow(hwnd);
+            return 0;
         case VK_SPACE:  // GIF 暂停 / 继续
             if (!g_frames.empty()) {
                 g_animPaused = !g_animPaused;
@@ -705,17 +993,26 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             return 0;
         case 'O':      if (GetKeyState(VK_CONTROL) & 0x8000) PromptOpen(hwnd); return 0;
-        case 'A':      // 一键关联 / 取消关联
-            if (IsRegistered()) {
-                UnregisterAssoc();
-                ShowNotice(hwnd, L"已取消文件关联");
-            } else {
-                RegisterAssoc();
-                ShowNotice(hwnd, L"已注册到系统：右键图片 → 打开方式 → 看图（可设为始终使用）");
-            }
-            return 0;
+        case 'A':      ToggleAssoc(hwnd); return 0;
         }
         break;
+
+    case WM_CONTEXTMENU: {
+        if ((HWND)wp != hwnd) return 0;
+        POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+        if (pt.x == -1 && pt.y == -1) {   // 键盘触发（Shift+F10 / 菜单键）：弹在窗口中央
+            RECT rc;
+            GetWindowRect(hwnd, &rc);
+            pt.x = (rc.left + rc.right) / 2;
+            pt.y = (rc.top + rc.bottom) / 2;
+        } else {
+            RECT crc = ClientRC(hwnd);
+            if (!PtInRect(&crc, pt)) break;   // 标题栏等非客户区交给系统菜单
+        }
+        int id = ShowContextMenu(hwnd, pt);
+        if (id) HandleMenu(hwnd, id);
+        return 0;
+    }
 
     case WM_DROPFILES: {
         HDROP hd = (HDROP)wp;
